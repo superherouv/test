@@ -227,3 +227,124 @@ class MultiTemporalCloudDataset(Dataset):
         ], dim=0)                                      # [L, 1, H, W]
 
         return cloudy_tensors, target_tensor, mask_tensors
+
+
+# ─── SingleTemporalCloudDataset ───────────────────────────────────────────────
+class SingleTemporalCloudDataset(Dataset):
+    """
+    Single-temporal cloud removal dataset  (CUHK-CR1 / CUHK-CR2).
+
+    Expected folder layout
+    ----------------------
+        root_dir/
+            input/    <stem>.png   ← cloud-degraded image
+            target/   <stem>.png   ← cloud-free reference
+
+    Cloud masks are synthesised on-the-fly as the absolute difference
+    |input − target| (thresholded, then blurred) — no explicit mask files
+    are required for CUHK-CR1 or CUHK-CR2.
+
+    Alternatively, if a ``masks/`` sub-directory exists it will be loaded
+    and used directly (same format as MultiTemporalCloudDataset masks:
+    pixel 0 = cloud, pixel 255 = clear, stored as float 1=cloud / 0=clear).
+
+    Returns
+    -------
+    (input_tensor, target_tensor, cloud_mask)
+        input_tensor : [C, H, W]  float32 in [0, 1]
+        target_tensor: [C, H, W]  float32 in [0, 1]
+        cloud_mask   : [1, H, W]  float32  1=cloud, 0=clear
+    """
+
+    def __init__(
+        self,
+        root_dir:   str,
+        patch_size: int  = 256,
+        augment:    bool = True,
+        mask_thresh: float = 0.05,   # |input-target| threshold for auto-mask
+    ):
+        super().__init__()
+        self.root_dir    = root_dir
+        self.patch_size  = patch_size
+        self.augment     = augment
+        self.mask_thresh = mask_thresh
+
+        self._input_dir  = os.path.join(root_dir, 'input')
+        self._target_dir = os.path.join(root_dir, 'target')
+        self._mask_dir   = os.path.join(root_dir, 'masks')
+
+        for d in (self._input_dir, self._target_dir):
+            if not os.path.isdir(d):
+                raise FileNotFoundError(
+                    f"Directory not found: {d}\n"
+                    f"Check --train_dir / --val_dir."
+                )
+
+        self._has_masks = os.path.isdir(self._mask_dir)
+        if self._has_masks:
+            print(f"[SingleCloudDataset] Using explicit masks from {self._mask_dir}")
+        else:
+            print(f"[SingleCloudDataset] No mask dir; synthesising masks from "
+                  f"|input−target| > {mask_thresh}")
+
+        self._stems = sorted(
+            os.path.splitext(f)[0]
+            for f in os.listdir(self._target_dir)
+            if f.lower().endswith(('.png', '.jpg', '.tif', '.tiff'))
+        )
+        assert len(self._stems) > 0, f"No images found in {self._target_dir}"
+        print(f"[SingleCloudDataset] {len(self._stems)} samples | "
+              f"patch={patch_size} | augment={augment}")
+
+    def __len__(self):
+        return len(self._stems)
+
+    def _find_file(self, directory: str, stem: str) -> str:
+        for ext in ('.png', '.jpg', '.tif', '.tiff', '.PNG', '.JPG'):
+            path = os.path.join(directory, stem + ext)
+            if os.path.isfile(path):
+                return path
+        raise FileNotFoundError(f"Cannot find '{stem}.*' in {directory}")
+
+    def _sync_augment(self, arrays: list) -> list:
+        if random.random() > 0.5:
+            arrays = [np.flipud(a).copy() for a in arrays]
+        if random.random() > 0.5:
+            arrays = [np.fliplr(a).copy() for a in arrays]
+        k = random.randint(0, 3)
+        if k > 0:
+            arrays = [np.rot90(a, k).copy() for a in arrays]
+        return arrays
+
+    def _crop(self, arrays: list, h: int, w: int) -> list:
+        ps = self.patch_size
+        r  = random.randint(0, h - ps)
+        c  = random.randint(0, w - ps)
+        return [a[r:r+ps, c:c+ps] for a in arrays]
+
+    def __getitem__(self, idx: int):
+        stem       = self._stems[idx]
+        input_img  = _load_img(self._find_file(self._input_dir,  stem))  # [H,W,C]
+        target_img = _load_img(self._find_file(self._target_dir, stem))  # [H,W,C]
+        H, W, _    = target_img.shape
+
+        if self._has_masks:
+            cloud_mask = _load_mask(self._find_file(self._mask_dir, stem))  # [H,W,1]
+        else:
+            # Auto-synthesis: pixels where input differs from target are cloudy
+            diff       = np.abs(input_img - target_img).mean(axis=2, keepdims=True)
+            cloud_mask = (diff > self.mask_thresh).astype(np.float32)       # [H,W,1]
+
+        if self.patch_size > 0 and H > self.patch_size and W > self.patch_size:
+            input_img, target_img, cloud_mask = self._crop(
+                [input_img, target_img, cloud_mask], H, W)
+
+        if self.augment:
+            input_img, target_img, cloud_mask = self._sync_augment(
+                [input_img, target_img, cloud_mask])
+
+        input_t  = torch.from_numpy(np.transpose(input_img,  (2, 0, 1)))
+        target_t = torch.from_numpy(np.transpose(target_img, (2, 0, 1)))
+        mask_t   = torch.from_numpy(np.transpose(cloud_mask, (2, 0, 1)))
+
+        return input_t, target_t, mask_t
