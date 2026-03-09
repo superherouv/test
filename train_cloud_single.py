@@ -1,39 +1,50 @@
 """
-Training script for multi-temporal cloud removal with Kalman-SNN.
+Training script for single-temporal cloud removal with CloudGate-SNN.
 
-Key differences from train.py
-------------------------------
-  - Input is [L, B, C, H, W] per batch (L temporal images stacked on dim 0)
-  - Model returns (restored, cloud_maps) tuple
-  - Loss = CloudRemovalLoss (SSIM+L1 + optional cloud-BCE + optional TMC)
-  - Metrics: PSNR on cloud-covered regions (cPSNR) in addition to full PSNR
+Supports CUHK-CR1 (thin clouds) and CUHK-CR2 (thick clouds).
+
+Dataset layout expected
+-----------------------
+    root/
+        input/   <stem>.png   ← cloud-degraded image
+        target/  <stem>.png   ← cloud-free reference
+        masks/   <stem>.png   ← optional cloud masks
+                                 (pixel 0=cloud, pixel 255=clear)
+
+Key differences from train_cloud.py
+-------------------------------------
+  - Input is [B, C, H, W] per batch (single image, no temporal stacking)
+  - Model is VLIFNet with cloud_mode='single'
+  - CloudGate applies a learnable per-step curriculum gating
+  - Returns (restored, cloud_map) tuple
+  - Loss = CloudRemovalLoss (SSIM+L1 + optional cloud-BCE)
+  - Metrics: PSNR, SSIM; cPSNR over synthesised cloud mask
 
 Visualizations (saved to checkpoints/<session>/samples/ and TensorBoard)
 ------------------------------------------------------------------------
-  - Rich matplotlib grids: all L cloudy frames | target | restored |
-    jet error-map | inferno cloud-maps  (saved every 10 epochs, train+val)
-  - TensorBoard image panels: individual named channels per split
-  - TensorBoard scalars: loss components, PSNR, cPSNR, grad-norm,
-    cloud-coverage, LR
+  - Rich matplotlib grids: input | target | restored | jet error-map |
+    inferno cloud-map  (saved every 10 epochs, train+val)
+  - TensorBoard image panels: named channels per split
+  - TensorBoard scalars: loss components, PSNR, SSIM, cPSNR,
+    grad-norm, cloud-coverage, LR
   - TensorBoard histogram: val cloud-prediction distribution per epoch
-  - PNG metric-history curves: multi-panel chart saved to samples/curves/
+  - PNG metric-history curves saved to samples/curves/
   - PNG cloud-coverage area chart saved to samples/curves/
 
-Example command
----------------
-    python train_cloud.py \\
-        --train_dir  /data/Sen2MTC/train \\
-        --val_dir    /data/Sen2MTC/val \\
-        --layout     Sen2MTC \\
-        --L          3 \\
-        --inp_channels 3 \\
-        --patch_size_train 256 \\
-        --patch_size_test  256 \\
-        --batch_size 4 \\
-        --num_epochs 200 \\
-        --lr         2e-4 \\
-        --lambda_cloud 0.1 \\
-        --session    kalman_snn_L3
+Example commands
+----------------
+    # CUHK-CR1 (thin clouds)
+    python train_cloud_single.py \\
+        --train_dir  /data/CUHK-CR1/train \\
+        --val_dir    /data/CUHK-CR1/val \\
+        --session    cuhk_cr1_T4
+
+    # CUHK-CR2 (thick clouds)
+    python train_cloud_single.py \\
+        --train_dir  /data/CUHK-CR2/train \\
+        --val_dir    /data/CUHK-CR2/val \\
+        --lambda_cloud 0.2 \\
+        --session    cuhk_cr2_T4
 """
 
 import os
@@ -56,10 +67,10 @@ from spikingjelly.activation_based import functional
 
 import utils
 import viz_utils
-from model      import model_cloud
-from losses     import CloudRemovalLoss
+from model            import model_cloud_single
+from losses           import CloudRemovalLoss
 from warmup_scheduler import GradualWarmupScheduler
-from dataset_cloud    import MultiTemporalCloudDataset
+from dataset_cloud    import SingleTemporalCloudDataset
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
@@ -68,42 +79,50 @@ def psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return 10 * torch.log10(1.0 / (mse + 1e-8))
 
 
+def ssim_metric(pred: torch.Tensor, target: torch.Tensor,
+                win: int = 11) -> torch.Tensor:
+    """Mean SSIM (uniform kernel) over a batch."""
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    pad     = win // 2
+    ch      = pred.shape[1]
+    kernel  = torch.ones(ch, 1, win, win, device=pred.device,
+                         dtype=pred.dtype) / (win * win)
+    mu_x    = torch.nn.functional.conv2d(pred,   kernel, padding=pad, groups=ch)
+    mu_y    = torch.nn.functional.conv2d(target, kernel, padding=pad, groups=ch)
+    sig_x2  = torch.nn.functional.conv2d(pred   * pred,   kernel, padding=pad, groups=ch) - mu_x * mu_x
+    sig_y2  = torch.nn.functional.conv2d(target * target, kernel, padding=pad, groups=ch) - mu_y * mu_y
+    sig_xy  = torch.nn.functional.conv2d(pred   * target, kernel, padding=pad, groups=ch) - mu_x * mu_y
+    num = (2 * mu_x * mu_y + C1) * (2 * sig_xy + C2)
+    den = (mu_x * mu_x + mu_y * mu_y + C1) * (sig_x2 + sig_y2 + C2)
+    return (num / den).mean()
+
+
 def cpsnr(pred: torch.Tensor, target: torch.Tensor,
-          cloud_masks: torch.Tensor) -> torch.Tensor:
-    """
-    Cloud-region PSNR: only evaluate pixels where ANY temporal mask = cloud.
-
-    pred, target : [B, C, H, W]
-    cloud_masks  : [L, B, 1, H, W]  (1 = cloud)
-    """
-    cloud_union = cloud_masks.max(dim=0).values   # [B, 1, H, W]
-
-    if cloud_union.sum() < 1:
+          cloud_mask: torch.Tensor) -> torch.Tensor:
+    """PSNR restricted to cloud-covered pixels."""
+    if cloud_mask.sum() < 1:
         return psnr(pred, target)
-
     err       = (pred - target) ** 2
-    cloud_mse = (err * cloud_union).sum() / (cloud_union.sum() * pred.shape[1] + 1e-8)
+    cloud_mse = (err * cloud_mask).sum() / (cloud_mask.sum() * pred.shape[1] + 1e-8)
     return 10 * torch.log10(1.0 / (cloud_mse + 1e-8))
 
 
-def _build_tb_images(cloudy_seq, target, restored, pred_cloud_maps, n=4):
+def _build_tb_images(inp, target, restored, cloud_map, n=4):
     """Build a dict of named image tensors for TensorBoard logging."""
-    L = cloudy_seq.shape[0]
     n = min(n, target.shape[0])
-    imgs = {}
-    for l in range(L):
-        imgs[f'cloudy_T{l+1}'] = cloudy_seq[l, :n]
-    imgs['target']   = target[:n]
-    imgs['restored'] = restored[:n].clamp(0, 1)
-    imgs['error_map'] = torch.stack([
-        viz_utils.error_heatmap(restored[i].clamp(0, 1), target[i])
-        for i in range(n)
-    ])
-    for l in range(L):
-        imgs[f'cloud_map_T{l+1}'] = torch.stack([
-            viz_utils.cloud_heatmap(pred_cloud_maps[l, i])
+    imgs = {
+        'input':      inp[:n],
+        'target':     target[:n],
+        'restored':   restored[:n].clamp(0, 1),
+        'error_map':  torch.stack([
+            viz_utils.error_heatmap(restored[i].clamp(0, 1), target[i])
             for i in range(n)
-        ])
+        ]),
+        'cloud_map':  torch.stack([
+            viz_utils.cloud_heatmap(cloud_map[i])
+            for i in range(n)
+        ]),
+    }
     return imgs
 
 
@@ -117,49 +136,50 @@ if __name__ == "__main__":
     torch.cuda.manual_seed_all(1234)
 
     # ── Args ──────────────────────────────────────────────────────────────────
-    parser = argparse.ArgumentParser(description='Kalman-SNN Multi-temporal Cloud Removal')
+    parser = argparse.ArgumentParser(
+        description='CloudGate-SNN Single-temporal Cloud Removal')
 
     # Paths
     parser.add_argument('--train_dir',        default='', type=str)
     parser.add_argument('--val_dir',          default='', type=str)
     parser.add_argument('--model_save_dir',   default='./checkpoints/', type=str)
     parser.add_argument('--pretrain_weights', default='', type=str)
-    parser.add_argument('--session',          default='KalmanSNN_cloud', type=str)
+    parser.add_argument('--session',          default='CloudGateSNN_single', type=str)
 
     # Data
-    parser.add_argument('--layout',           default='Sen2MTC', type=str,
-                        choices=['Sen2MTC', 'flat'],
-                        help='Dataset folder layout (Sen2MTC or flat)')
-    parser.add_argument('--L',                default=3, type=int,
-                        help='Number of temporal images per sample')
-    parser.add_argument('--inp_channels',     default=3, type=int,
-                        help='Input channels per image (3=RGB, 4=RGB+NIR)')
+    parser.add_argument('--inp_channels',     default=3, type=int)
     parser.add_argument('--patch_size_train', default=256, type=int)
     parser.add_argument('--patch_size_test',  default=256, type=int)
+    parser.add_argument('--mask_thresh',      default=0.05, type=float,
+                        help='|input-target| threshold for auto cloud mask synthesis')
     parser.add_argument('--num_workers',      default=4, type=int)
+
+    # Model
+    parser.add_argument('--T',                default=4, type=int,
+                        help='SNN time steps (CloudGate curriculum length)')
 
     # Training
     parser.add_argument('--num_epochs',       default=200, type=int)
-    parser.add_argument('--batch_size',       default=4, type=int)
+    parser.add_argument('--batch_size',       default=8, type=int)
     parser.add_argument('--lr',               default=2e-4, type=float)
     parser.add_argument('--min_lr',           default=1e-7, type=float)
     parser.add_argument('--warmup_epochs',    default=5, type=int)
     parser.add_argument('--clip_grad',        default=1.0, type=float)
     parser.add_argument('--val_epochs',       default=5, type=int)
 
-    # Loss weights
+    # Loss
     parser.add_argument('--lambda_cloud',     default=0.1, type=float,
                         help='Weight of cloud-detection BCE loss')
-    parser.add_argument('--lambda_tmc',       default=0.0, type=float,
-                        help='Weight of TMC temporal calibration loss')
 
     # Misc
     parser.add_argument('--use_refinement',   default=False, type=bool)
     args = parser.parse_args()
 
     # ── Directories ───────────────────────────────────────────────────────────
-    model_dir  = os.path.join(args.model_save_dir, 'KalmanSNN_cloud', 'models', args.session)
-    sample_dir = os.path.join(args.model_save_dir, 'KalmanSNN_cloud', 'samples', args.session)
+    model_dir  = os.path.join(args.model_save_dir,
+                              'CloudGateSNN_single', 'models', args.session)
+    sample_dir = os.path.join(args.model_save_dir,
+                              'CloudGateSNN_single', 'samples', args.session)
     curves_dir = os.path.join(sample_dir, 'curves')
     utils.mkdir(model_dir)
     utils.mkdir(sample_dir)
@@ -168,16 +188,16 @@ if __name__ == "__main__":
     utils.mkdir(curves_dir)
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    net = model_cloud(L=args.L, inp_channels=args.inp_channels,
-                      use_refinement=args.use_refinement)
+    net = model_cloud_single(inp_channels=args.inp_channels,
+                             T=args.T,
+                             use_refinement=args.use_refinement)
     net.cuda()
     functional.set_step_mode(net, step_mode='m')
     functional.set_backend(net, backend='cupy')
 
     device_ids = list(range(torch.cuda.device_count()))
-    print(f"[Init] GPUs: {device_ids}  |  L={args.L}  |  layout={args.layout}")
+    print(f"[Init] GPUs: {device_ids}  |  T={args.T}  |  cloud_mode=single")
 
-    # Optional pretrain
     if args.pretrain_weights and os.path.isfile(args.pretrain_weights):
         state = torch.load(args.pretrain_weights, map_location='cpu')
         net.load_state_dict(state.get('state_dict', state), strict=False)
@@ -198,22 +218,20 @@ if __name__ == "__main__":
 
     # ── Loss ──────────────────────────────────────────────────────────────────
     criterion = CloudRemovalLoss(lambda_cloud=args.lambda_cloud,
-                                 lambda_tmc=args.lambda_tmc).cuda()
+                                 lambda_tmc=0.0).cuda()
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    train_ds = MultiTemporalCloudDataset(
-        root_dir   = args.train_dir,
-        L          = args.L,
-        patch_size = args.patch_size_train,
-        layout     = args.layout,
-        augment    = True,
+    train_ds = SingleTemporalCloudDataset(
+        root_dir    = args.train_dir,
+        patch_size  = args.patch_size_train,
+        augment     = True,
+        mask_thresh = args.mask_thresh,
     )
-    val_ds = MultiTemporalCloudDataset(
-        root_dir   = args.val_dir,
-        L          = args.L,
-        patch_size = args.patch_size_test,
-        layout     = args.layout,
-        augment    = False,
+    val_ds = SingleTemporalCloudDataset(
+        root_dir    = args.val_dir,
+        patch_size  = args.patch_size_test,
+        augment     = False,
+        mask_thresh = args.mask_thresh,
     )
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
@@ -227,7 +245,7 @@ if __name__ == "__main__":
     writer = SummaryWriter(model_dir)
 
     print(f"[Train] epochs={args.num_epochs}  batch={args.batch_size}  "
-          f"lr={args.lr}  λ_cloud={args.lambda_cloud}  λ_tmc={args.lambda_tmc}")
+          f"lr={args.lr}  λ_cloud={args.lambda_cloud}")
     print(f"[Train] train={len(train_ds)}  val={len(val_ds)}")
     print('=' * 80)
 
@@ -240,6 +258,7 @@ if __name__ == "__main__":
     history = {
         'Train PSNR':     [],
         'Val PSNR':       [],
+        'Val SSIM':       [],
         'Val cPSNR':      [],
         'Epoch Loss':     [],
         'Grad Norm':      [],
@@ -255,24 +274,28 @@ if __name__ == "__main__":
         epoch_grad_norms      = []
         epoch_cloud_coverages = []
 
-        for batch_idx, (cloudy_seq, target, cloud_masks) in enumerate(
+        for batch_idx, (inp_img, target, cloud_mask) in enumerate(
                 tqdm(train_loader, desc=f'Epoch {epoch}', unit='batch')):
 
-            cloudy_seq  = cloudy_seq.cuda().permute(1, 0, 2, 3, 4)  # [L,B,C,H,W]
-            target      = target.cuda()                               # [B, C, H, W]
-            cloud_masks = cloud_masks.cuda().permute(1, 0, 2, 3, 4) # [L,B,1,H,W]
+            inp_img    = inp_img.cuda()      # [B, C, H, W]
+            target     = target.cuda()       # [B, C, H, W]
+            cloud_mask = cloud_mask.cuda()   # [B, 1, H, W]
 
             for p in net.parameters():
                 p.grad = None
 
             # Forward
-            restored, pred_cloud_maps = net(cloudy_seq)
+            restored, pred_cloud_map = net(inp_img)
 
-            # Loss
-            gt_masks_for_loss = cloud_masks if train_ds._has_masks else None
-            loss, log_dict    = criterion(
+            # cloud_maps expected as [L, B, 1, H, W] by CloudRemovalLoss;
+            # for single-temporal: L=1
+            pred_maps_loss = pred_cloud_map.unsqueeze(0)   # [1, B, 1, H, W]
+            gt_masks_loss  = cloud_mask.unsqueeze(0)       # [1, B, 1, H, W]
+            gt_masks_for_loss = gt_masks_loss if train_ds._has_masks else None
+
+            loss, log_dict = criterion(
                 restored, target,
-                pred_cloud_maps,
+                pred_maps_loss,
                 gt_masks_for_loss,
             )
 
@@ -290,29 +313,27 @@ if __name__ == "__main__":
             optimizer.step()
             functional.reset_net(net)
 
-            # Per-batch metrics
             with torch.no_grad():
                 p_val = psnr(restored.clamp(0, 1), target)
             train_psnrs.append(p_val.item())
             epoch_loss += loss.item()
             epoch_grad_norms.append(grad_norm)
 
-            # Cloud coverage ratio
-            cloud_cov = cloud_masks.float().mean().item()
+            cloud_cov = cloud_mask.float().mean().item()
             epoch_cloud_coverages.append(cloud_cov)
 
             # TensorBoard per-step scalars
             for k, v in log_dict.items():
                 writer.add_scalar(f'train/{k}', v, step_iter)
-            writer.add_scalar('train/grad_norm',       grad_norm, step_iter)
-            writer.add_scalar('train/cloud_coverage',  cloud_cov, step_iter)
+            writer.add_scalar('train/grad_norm',      grad_norm, step_iter)
+            writer.add_scalar('train/cloud_coverage', cloud_cov, step_iter)
             step_iter += 1
 
         # ── Per-epoch scalars ──────────────────────────────────────────────
-        train_psnr_mean   = np.mean(train_psnrs)
-        grad_norm_mean    = np.mean(epoch_grad_norms)
-        cloud_cov_mean    = np.mean(epoch_cloud_coverages)
-        epoch_loss_mean   = epoch_loss / len(train_loader)
+        train_psnr_mean  = np.mean(train_psnrs)
+        grad_norm_mean   = np.mean(epoch_grad_norms)
+        cloud_cov_mean   = np.mean(epoch_cloud_coverages)
+        epoch_loss_mean  = epoch_loss / len(train_loader)
 
         writer.add_scalar('train/psnr',            train_psnr_mean, epoch)
         writer.add_scalar('train/epoch_loss',      epoch_loss_mean, epoch)
@@ -329,16 +350,14 @@ if __name__ == "__main__":
         # ── Training sample visualization (every 10 epochs) ───────────────
         if epoch % 10 == 0:
             with torch.no_grad():
-                # Rich matplotlib comparison grid
                 sample_path = os.path.join(
                     sample_dir, 'train', f'epoch_{epoch}.png')
-                viz_utils.save_rich_comparison_multi(
-                    cloudy_seq, target, restored.clamp(0, 1),
-                    pred_cloud_maps, sample_path)
+                viz_utils.save_rich_comparison_single(
+                    inp_img, target, restored.clamp(0, 1),
+                    pred_cloud_map, sample_path)
 
-                # TensorBoard image panels
                 tb_imgs = _build_tb_images(
-                    cloudy_seq, target, restored, pred_cloud_maps)
+                    inp_img, target, restored, pred_cloud_map)
                 viz_utils.log_images_tensorboard(
                     writer, 'train_images', tb_imgs, epoch)
 
@@ -346,40 +365,43 @@ if __name__ == "__main__":
         if epoch % args.val_epochs == 0:
             net.eval()
             val_psnrs        = []
+            val_ssims        = []
             val_cpsnrs       = []
             val_sample_saved = False
             all_cloud_preds  = []
 
-            for cloudy_seq_v, target_v, masks_v in tqdm(
+            for inp_v, target_v, mask_v in tqdm(
                     val_loader, desc='  Val', leave=False):
-                cloudy_seq_v = cloudy_seq_v.cuda().permute(1, 0, 2, 3, 4)
-                target_v     = target_v.cuda()
-                masks_v      = masks_v.cuda().permute(1, 0, 2, 3, 4)
+                inp_v    = inp_v.cuda()
+                target_v = target_v.cuda()
+                mask_v   = mask_v.cuda()
 
                 with torch.no_grad():
-                    restored_v, pred_maps_v = net(cloudy_seq_v)
+                    restored_v, pred_map_v = net(inp_v)
                 functional.reset_net(net)
 
                 restored_v = restored_v.clamp(0, 1)
                 val_psnrs.append(psnr(restored_v, target_v).item())
-                val_cpsnrs.append(cpsnr(restored_v, target_v, masks_v).item())
-                all_cloud_preds.append(pred_maps_v.detach().cpu())
+                val_ssims.append(ssim_metric(restored_v, target_v).item())
+                val_cpsnrs.append(cpsnr(restored_v, target_v, mask_v).item())
+                all_cloud_preds.append(pred_map_v.detach().cpu())
 
                 if not val_sample_saved:
-                    # Rich matplotlib grid
-                    viz_utils.save_rich_comparison_multi(
-                        cloudy_seq_v, target_v, restored_v, pred_maps_v,
+                    viz_utils.save_rich_comparison_single(
+                        inp_v, target_v, restored_v, pred_map_v,
                         os.path.join(sample_dir, 'val', f'epoch_{epoch}.png'))
-                    # TensorBoard image panels
                     tb_imgs_v = _build_tb_images(
-                        cloudy_seq_v, target_v, restored_v, pred_maps_v)
+                        inp_v, target_v, restored_v, pred_map_v)
                     viz_utils.log_images_tensorboard(
                         writer, 'val_images', tb_imgs_v, epoch)
                     val_sample_saved = True
 
             val_psnr_mean  = np.mean(val_psnrs)
+            val_ssim_mean  = np.mean(val_ssims)
             val_cpsnr_mean = np.mean(val_cpsnrs)
+
             writer.add_scalar('val/psnr',  val_psnr_mean,  epoch)
+            writer.add_scalar('val/ssim',  val_ssim_mean,  epoch)
             writer.add_scalar('val/cpsnr', val_cpsnr_mean, epoch)
 
             # Cloud prediction distribution histogram
@@ -388,6 +410,7 @@ if __name__ == "__main__":
             writer.add_histogram('val/cloud_pred_distribution', flat_preds, epoch)
 
             history['Val PSNR'].append((epoch, val_psnr_mean))
+            history['Val SSIM'].append((epoch, val_ssim_mean))
             history['Val cPSNR'].append((epoch, val_cpsnr_mean))
 
             if val_psnr_mean > best_psnr:
@@ -397,6 +420,7 @@ if __name__ == "__main__":
                            os.path.join(model_dir, 'model_best.pth'))
 
             print(f"  Val PSNR={val_psnr_mean:.3f}  "
+                  f"SSIM={val_ssim_mean:.4f}  "
                   f"cPSNR={val_cpsnr_mean:.3f}  "
                   f"(best={best_psnr:.3f} @ ep{best_epoch})")
 
@@ -404,7 +428,7 @@ if __name__ == "__main__":
             viz_utils.save_metric_curves(
                 history,
                 os.path.join(curves_dir, 'metrics.png'),
-                title=f'Kalman-SNN Training Metrics  (session={args.session})')
+                title=f'CloudGate-SNN Training Metrics  (session={args.session})')
             viz_utils.save_cloud_coverage_plot(
                 history['Cloud Coverage'],
                 os.path.join(curves_dir, 'cloud_coverage.png'))
@@ -431,7 +455,7 @@ if __name__ == "__main__":
     viz_utils.save_metric_curves(
         history,
         os.path.join(curves_dir, 'metrics_final.png'),
-        title=f'Kalman-SNN Training Metrics — Final  (session={args.session})')
+        title=f'CloudGate-SNN Training Metrics — Final  (session={args.session})')
     viz_utils.save_cloud_coverage_plot(
         history['Cloud Coverage'],
         os.path.join(curves_dir, 'cloud_coverage_final.png'))

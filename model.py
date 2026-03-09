@@ -193,6 +193,67 @@ class KalmanFeatureFilter(nn.Module):
         return filtered, gains
 
 
+# ─── CloudGate ────────────────────────────────────────────────────────────────
+class CloudGate(nn.Module):
+    """
+    Learnable per-step cloud feature suppression for single-temporal mode.
+
+    Motivation
+    ----------
+    In single-temporal cloud removal the SNN's T internal steps serve as a
+    progressive reconstruction curriculum.  Cloud regions are suppressed early
+    (forcing context-based inpainting from surrounding clear pixels) and
+    gradually revealed at later steps (allowing direct refinement).
+
+    Mechanism
+    ---------
+    For SNN step t ∈ {0, …, T-1}:
+
+        feat_gated[t] = feat[t]  ×  (1 − g_t · cloud_map)
+
+        g_t = sigmoid(gate_logit_t)  ∈ (0, 1)
+
+    Initialisation: gate_logits linearly from +2.2 to −2.2
+        → g_0 ≈ 0.90  (strong suppression at step 0)
+        → g_{T-1} ≈ 0.10  (weak suppression at last step)
+
+    During training the T scalars are learnt end-to-end; the network finds the
+    optimal curriculum automatically.
+
+    Parameters
+    ----------
+    T : int  number of SNN time steps
+
+    Forward inputs
+    --------------
+    feats     : [T, B, C, H, W]  embedded temporal features (all identical for
+                                  single-temporal, because input is repeat(T))
+    cloud_map : [B, 1, H, W]     cloud probability in [0, 1]
+
+    Returns
+    -------
+    gated     : [T, B, C, H, W]  cloud-suppressed feature sequence
+    """
+
+    def __init__(self, T: int):
+        super().__init__()
+        # Linearly spaced logits → sigmoid gives monotone decrease from ~0.9 to ~0.1
+        self.gate_logits = nn.Parameter(torch.linspace(2.2, -2.2, T))
+
+    def forward(self, feats: torch.Tensor,
+                cloud_map: torch.Tensor) -> torch.Tensor:
+        T      = feats.shape[0]
+        gates  = torch.sigmoid(self.gate_logits)          # [T]  all in (0,1)
+
+        # Broadcast:  gates [T,1,1,1,1]  ×  cloud_map [1,B,1,H,W]
+        #  → suppression_map [T, B, 1, H, W]
+        suppression = gates.view(T, 1, 1, 1, 1) * cloud_map.unsqueeze(0)
+
+        # gate_map [T, B, 1, H, W] broadcasts over C
+        gate_map = 1.0 - suppression                       # [T, B, 1, H, W]
+        return feats * gate_map                            # [T, B, C, H, W]
+
+
 # ─── PixelShuffleLIFBlock ─────────────────────────────────────────────────────
 class PixelShuffleLIFBlock(nn.Module):
     def __init__(self, in_channels, downsample_factor=2):
@@ -482,22 +543,29 @@ class VLIFNet(nn.Module):
     """
     VLIFNet: Spiking U-Net for image restoration.
 
-    Two operating modes
-    -------------------
-    cloud_mode=False  (default, backward-compatible)
+    Three operating modes  (cloud_mode parameter)
+    -----------------------------------------------
+    'off' / False  (default, backward-compatible)
         Single input [B, C, H, W] is repeated T times.
         Returns: restored image [B, C, H, W]
 
-    cloud_mode=True   (multi-temporal cloud removal)
+    'multi' / True  (multi-temporal cloud removal, e.g. Sen2 MTC New)
         Input is a sequence [L, B, C, H, W] of L temporal images.
         CloudEstimator estimates per-image cloud probability maps.
         KalmanFeatureFilter fuses the L embedded feature maps with
         theoretically-optimal Kalman weights before the SNN encoder.
         Returns: (restored [B, C, H, W], cloud_maps [L, B, 1, H, W])
-        The cloud_maps can be used to compute cloud detection auxiliary loss.
 
-    Two-level temporal hierarchy (cloud_mode=True)
-    -----------------------------------------------
+    'single'  (single-temporal cloud removal, e.g. CUHK-CR1 / CUHK-CR2)
+        Single input [B, C, H, W].
+        CloudEstimator detects cloud regions from the input image.
+        CloudGate applies a learned per-step curriculum: cloud-region
+        features are suppressed at early SNN steps (forcing context-based
+        inpainting) and gradually revealed at later steps (refinement).
+        Returns: (restored [B, C, H, W], cloud_map [B, 1, H, W])
+
+    Two-level temporal hierarchy (cloud_mode='multi')
+    --------------------------------------------------
     Level 1 – Kalman   (coarse, L images):
         Builds running state estimate, discarding cloudy observations.
     Level 2 – SNN r²   (fine, r²=4 spatial sub-steps per image):
@@ -512,9 +580,9 @@ class VLIFNet(nn.Module):
         en_num_blocks: list = None,
         de_num_blocks: list = None,
         bias: bool = False,
-        T: int = 4,          # SNN time steps (= L when cloud_mode=True)
-        L: int = 4,          # number of temporal images (= T when cloud_mode=True)
-        cloud_mode: bool = False,
+        T: int = 4,          # SNN time steps (= L when cloud_mode='multi')
+        L: int = 4,          # number of temporal images (= T when cloud_mode='multi')
+        cloud_mode = False,  # False/'off' | True/'multi' | 'single'
         use_refinement: bool = False,
     ):
         super(VLIFNet, self).__init__()
@@ -524,18 +592,32 @@ class VLIFNet(nn.Module):
         if de_num_blocks is None:
             de_num_blocks = [4, 4, 6, 6]
 
+        # Normalise cloud_mode to string for consistent branch logic
+        if isinstance(cloud_mode, bool):
+            cloud_mode = 'multi' if cloud_mode else 'off'
+        assert cloud_mode in ('off', 'single', 'multi'), \
+            f"cloud_mode must be 'off', 'single', or 'multi'; got {cloud_mode!r}"
+
         functional.set_backend(self, backend='cupy')
         functional.set_step_mode(self, step_mode='m')
 
-        self.T           = T
-        self.L           = L
-        self.cloud_mode  = cloud_mode
+        self.T              = T
+        self.L              = L
+        self.cloud_mode     = cloud_mode
         self.use_refinement = use_refinement
 
-        # ── Cloud modules (only for cloud_mode) ────────────────────────────
-        if cloud_mode:
+        # ── Cloud modules (mode-dependent) ─────────────────────────────────
+        if cloud_mode in ('single', 'multi'):
+            # Shared: lightweight cloud probability estimator
             self.cloud_estimator = CloudEstimator(in_channels=inp_channels)
-            self.kalman_filter   = KalmanFeatureFilter()
+
+        if cloud_mode == 'multi':
+            # Multi-temporal: Kalman-optimal feature fusion across L images
+            self.kalman_filter = KalmanFeatureFilter()
+
+        if cloud_mode == 'single':
+            # Single-temporal: learned per-step cloud feature curriculum
+            self.cloud_gate = CloudGate(T)
 
         # ── Patch embedding ────────────────────────────────────────────────
         self.patch_embed = OverlapPatchEmbed(in_c=inp_channels, embed_dim=dim, T=T)
@@ -601,18 +683,18 @@ class VLIFNet(nn.Module):
         """
         Parameters
         ----------
-        inp_img : [B, C, H, W]          when cloud_mode=False
-                  [L, B, C, H, W]       when cloud_mode=True
+        inp_img : [B, C, H, W]     when cloud_mode='off' or 'single'
+                  [L, B, C, H, W]  when cloud_mode='multi'
 
         Returns
         -------
-        cloud_mode=False : restored  [B, C, H, W]
-        cloud_mode=True  : (restored [B, C, H, W],
-                            cloud_maps [L, B, 1, H, W])
+        'off'    : restored  [B, C, H, W]
+        'single' : (restored [B, C, H, W],  cloud_map  [B, 1, H, W])
+        'multi'  : (restored [B, C, H, W],  cloud_maps [L, B, 1, H, W])
         """
 
         # ── Branch: original single-image mode (backward compat) ───────────
-        if not self.cloud_mode:
+        if self.cloud_mode == 'off':
             short = inp_img.clone()
             if inp_img.dim() == 4:
                 inp_img = inp_img.unsqueeze(0).repeat(self.T, 1, 1, 1, 1)
@@ -645,10 +727,56 @@ class VLIFNet(nn.Module):
 
             return self.output(out_dec_level1.mean(0)) + short
 
+        # ── Branch: single-temporal cloud removal (CUHK-CR1 / CUHK-CR2) ────
+        if self.cloud_mode == 'single':
+            short = inp_img.clone()                            # [B, C, H, W]
+
+            # 1. Cloud map from single input
+            cloud_map = self.cloud_estimator(inp_img)          # [B, 1, H, W]
+
+            # 2. Expand to T steps (same image repeated, SNN acts as iterator)
+            inp_seq = inp_img.unsqueeze(0).repeat(self.T, 1, 1, 1, 1)
+
+            # 3. Patch embed
+            inp_enc = self.patch_embed(inp_seq)                # [T, B, dim, H, W]
+
+            # 4. Cloud-curriculum gating: suppress cloud regions early, reveal later
+            inp_enc = self.cloud_gate(inp_enc, cloud_map)      # [T, B, dim, H, W]
+
+            # 5-9. Standard encoder-decoder (identical control flow to 'off' branch)
+            out_enc_level1 = self.encoder_level1(inp_enc)
+            inp_enc_level2 = self.down1_2(out_enc_level1)
+            out_enc_level2 = self.encoder_level2(inp_enc_level2)
+            inp_enc_level3 = self.down2_3(out_enc_level2)
+            out_enc_level3 = self.encoder_level3(inp_enc_level3)
+
+            out_dec_level3 = self.decoder_level3(out_enc_level3)
+            inp_dec_level2 = self.up3_2(out_dec_level3)
+            inp_dec_level2 = torch.cat([inp_dec_level2, out_enc_level2], dim=2)
+            inp_dec_level2 = self.lif_level2(inp_dec_level2)
+            inp_dec_level2 = self.reduce_conv_level2(inp_dec_level2)
+            inp_dec_level2 = self.reduce_bn_level2(inp_dec_level2)
+            out_dec_level2 = self.decoder_level2(inp_dec_level2)
+
+            inp_dec_level1 = self.up2_1(out_dec_level2)
+            inp_dec_level1 = torch.cat([inp_dec_level1, out_enc_level1], dim=2)
+            inp_dec_level1 = self.lif_level1(inp_dec_level1)
+            inp_dec_level1 = self.reduce_conv_level1(inp_dec_level1)
+            inp_dec_level1 = self.reduce_bn_level1(inp_dec_level1)
+            out_dec_level1 = self.decoder_level1(inp_dec_level1)
+            out_dec_level1 = self.additional_sunet_level1(out_dec_level1)
+
+            if self.use_refinement:
+                out_dec_level1 = self.refinement_blocks(out_dec_level1)
+
+            # 10. Mean over T steps + residual
+            restored = self.output(out_dec_level1.mean(0)) + short
+            return restored, cloud_map
+
         # ── Branch: multi-temporal cloud removal ───────────────────────────
         # inp_img: [L, B, C, H, W]
         assert inp_img.dim() == 5, (
-            "cloud_mode=True expects input [L, B, C, H, W], "
+            "cloud_mode='multi' expects input [L, B, C, H, W], "
             f"got shape {tuple(inp_img.shape)}"
         )
         L, B, C, H, W = inp_img.shape
@@ -750,5 +878,38 @@ def model_cloud(L: int = 3, inp_channels: int = 3,
         T=L,            # dual-time unification: SNN steps = temporal images
         L=L,
         cloud_mode=True,
+        use_refinement=use_refinement,
+    ).cuda()
+
+
+def model_cloud_single(inp_channels: int = 3, T: int = 4,
+                       use_refinement: bool = False) -> VLIFNet:
+    """
+    Single-temporal cloud removal model  (CUHK-CR1 / CUHK-CR2).
+
+    The SNN's T internal time steps serve as a progressive reconstruction
+    curriculum via the CloudGate module:
+      • Early steps suppress cloud-region features → forces context inpainting
+      • Later steps gradually reveal them        → allows direct refinement
+
+    Parameters
+    ----------
+    inp_channels : 3 for RGB (CUHK-CR1 & CR2 both provide RGB)
+    T            : SNN time steps for the curriculum (default 4)
+
+    Returns
+    -------
+    VLIFNet with cloud_mode='single'
+        forward(inp [B,C,H,W]) → (restored [B,C,H,W], cloud_map [B,1,H,W])
+    """
+    return VLIFNet(
+        inp_channels=inp_channels,
+        out_channels=3,
+        dim=48,
+        en_num_blocks=[4, 4, 8, 8],
+        de_num_blocks=[2, 2, 2, 2],
+        T=T,
+        L=T,            # L not used in 'single' mode, kept equal for consistency
+        cloud_mode='single',
         use_refinement=use_refinement,
     ).cuda()

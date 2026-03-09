@@ -2,15 +2,20 @@
 Shape verification for the Kalman-SNN cloud removal model.
 
 Tests (CPU-only, no GPU/cupy required for shape checks):
-  1. CloudEstimator:        [B, C, H, W]  → [B, 1, H, W]
-  2. KalmanFeatureFilter:   [L, B, C, H, W] + cloud_maps → filtered + gains
-  3. SUNet_Level1_Block T=3: [L=3, B, C, H, W] → same shape
-  4. SUNet_Level1_Block T=4: [L=4, B, C, H, W] → same shape (backward compat)
-  5. CloudRemovalLoss:      forward pass returns scalar + log dict
-  6. MultiTemporalCloudDataset: mock dir, __getitem__ shapes
-  7. Full model_cloud forward: [L, B, C, H, W] → ([B, C, H, W], [L, B, 1, H, W])
-  8. Original model forward (backward compat): [B, C, H, W] → [B, C, H, W]
-  9. Kalman P dynamics: verify P shrinks on clear frames, grows on cloudy frames
+  1.  CloudEstimator:          [B, C, H, W]  → [B, 1, H, W]
+  2.  KalmanFeatureFilter:     [L, B, C, H, W] + cloud_maps → filtered + gains
+  3.  Kalman P dynamics:       gains decrease on all-cloudy, high on clear
+  4.  SUNet_Level1_Block T=3:  [L=3, B, C, H, W] → same shape
+  5.  SUNet_Level1_Block T=4:  [L=4, B, C, H, W] → same shape (backward compat)
+  6.  CloudRemovalLoss:        forward pass returns scalar + log dict
+  7.  MultiTemporalCloudDataset: mock dir, __getitem__ shapes
+  8.  Full model_cloud forward (multi): [L, B, C, H, W] → ([B, C, H, W], [L, B, 1, H, W])
+  9.  Original model forward (backward compat): [B, C, H, W] → [B, C, H, W]
+  10. Gradient flow through Kalman filter
+  11. Parameter count comparison
+  12. CloudGate: shapes and monotone gate initialisation
+  13. Full model_cloud_single forward (single): [B, C, H, W] → ([B, C, H, W], [B, 1, H, W])
+  14. SingleTemporalCloudDataset: mock dir, __getitem__ shapes
 """
 
 import sys, os
@@ -304,9 +309,129 @@ check("overhead < 5% of base", abs(p_new) < 0.05 * p_base,
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+print("\n══ 12. CloudGate ════════════════════════════════════════════════════════")
+T_g = 4
+cg  = M.CloudGate(T=T_g)
+
+# Shape check
+feats_g  = torch.randn(T_g, 2, 16, 32, 32)
+cmap_g2  = torch.sigmoid(torch.randn(2, 1, 32, 32))
+gated    = cg(feats_g, cmap_g2)
+check("gated shape == feats shape", gated.shape == feats_g.shape, str(gated.shape))
+
+# Cloud-only region should be suppressed at early steps
+with torch.no_grad():
+    cmap_full  = torch.ones(1, 1, 8, 8)           # fully cloudy
+    feats_ones = torch.ones(T_g, 1, 4, 8, 8)      # feature = 1 everywhere
+    gated_ones = cg(feats_ones, cmap_full)
+    # early step (t=0): gate ≈ 0.9, suppression ≈ 0.9 → gated ≈ 0.10
+    # last step (T-1): gate ≈ 0.1, suppression ≈ 0.1 → gated ≈ 0.90
+    early_mean = gated_ones[0].mean().item()
+    late_mean  = gated_ones[-1].mean().item()
+    check("early step more suppressed than late step (curriculum)",
+          early_mean < late_mean,
+          f"early={early_mean:.3f}  late={late_mean:.3f}")
+
+# Gate logits are learnable
+check("gate_logits is nn.Parameter",
+      isinstance(cg.gate_logits, torch.nn.Parameter))
+check("gate_logits has T values",
+      cg.gate_logits.shape == (T_g,), str(cg.gate_logits.shape))
+
+# Gradient flows through gate
+feats_req = feats_g.clone().requires_grad_(True)
+gated_req = cg(feats_req, cmap_g2)
+gated_req.mean().backward()
+check("gradient flows through CloudGate", feats_req.grad is not None)
+check("gate_logits gradient exists",      cg.gate_logits.grad is not None)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+print("\n══ 13. Full model_cloud_single forward (cloud_mode=single) ═════════════")
+net_s = M.VLIFNet(inp_channels=3, out_channels=3, dim=8,
+                   en_num_blocks=[1,1,1,1], de_num_blocks=[1,1,1,1],
+                   T=4, L=4, cloud_mode='single').cpu()
+B_s   = 2
+inp_s = torch.randn(B_s, 3, 32, 32)
+with torch.no_grad():
+    out_s, cmap_s = net_s(inp_s)
+
+check("restored  [B, C, H, W]",  out_s.shape  == (B_s, 3, 32, 32), str(out_s.shape))
+check("cloud_map [B, 1, H, W]",  cmap_s.shape == (B_s, 1, 32, 32), str(cmap_s.shape))
+check("cloud_map in (0,1)",       cmap_s.min() >= 0 and cmap_s.max() <= 1,
+      f"min={cmap_s.min():.3f} max={cmap_s.max():.3f}")
+check("restored finite",          torch.isfinite(out_s).all())
+check("returns tuple of 2",       isinstance(out_s, torch.Tensor) and
+                                   isinstance(cmap_s, torch.Tensor))
+
+# Check gradient flows end-to-end in single mode
+net_s.train()
+inp_grad = torch.randn(B_s, 3, 32, 32, requires_grad=True)
+out_g2, cm_g2 = net_s(inp_grad)
+(out_g2.mean() + cm_g2.mean()).backward()
+check("input gradient flows in single mode", inp_grad.grad is not None)
+check("CloudGate logits grad in single mode",
+      net_s.cloud_gate.gate_logits.grad is not None)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+print("\n══ 14. SingleTemporalCloudDataset ═══════════════════════════════════════")
+from dataset_cloud import SingleTemporalCloudDataset
+
+tmp2 = tempfile.mkdtemp()
+try:
+    # Create mock CUHK-CR layout: input/ + target/ (no explicit masks)
+    for sub in ['input', 'target']:
+        os.makedirs(os.path.join(tmp2, sub), exist_ok=True)
+    for stem in ['img001', 'img002', 'img003']:
+        arr8 = (np.random.rand(128, 128, 3) * 255).astype(np.uint8)
+        Image.fromarray(arr8).save(os.path.join(tmp2, 'input',  f'{stem}.png'))
+        # Target slightly different to generate non-trivial auto-mask
+        arr8b = np.clip(arr8.astype(np.int32) + np.random.randint(-30, 30, arr8.shape),
+                        0, 255).astype(np.uint8)
+        Image.fromarray(arr8b).save(os.path.join(tmp2, 'target', f'{stem}.png'))
+
+    ds_s = SingleTemporalCloudDataset(
+        root_dir    = tmp2,
+        patch_size  = 64,
+        augment     = True,
+        mask_thresh = 0.05,
+    )
+    check("dataset length == 3", len(ds_s) == 3, str(len(ds_s)))
+    check("no explicit masks (auto-synthesis)", not ds_s._has_masks)
+
+    inp_t, tgt_t, msk_t = ds_s[0]
+    check("input  [C, H, W]",   inp_t.shape == (3, 64, 64), str(inp_t.shape))
+    check("target [C, H, W]",   tgt_t.shape == (3, 64, 64), str(tgt_t.shape))
+    check("mask   [1, H, W]",   msk_t.shape == (1, 64, 64), str(msk_t.shape))
+    check("input in [0,1]",     inp_t.min() >= 0 and inp_t.max() <= 1)
+    check("mask  in {0,1}",     msk_t.min() >= 0 and msk_t.max() <= 1)
+
+    # Also test with explicit mask dir
+    os.makedirs(os.path.join(tmp2, 'masks'), exist_ok=True)
+    for stem in ['img001', 'img002', 'img003']:
+        mask8 = np.random.choice([0, 255], size=(128, 128)).astype(np.uint8)
+        Image.fromarray(mask8).save(os.path.join(tmp2, 'masks', f'{stem}.png'))
+
+    ds_sm = SingleTemporalCloudDataset(
+        root_dir    = tmp2,
+        patch_size  = 64,
+        augment     = False,
+        mask_thresh = 0.05,
+    )
+    check("explicit mask dir detected",    ds_sm._has_masks)
+    _, _, msk_explicit = ds_sm[0]
+    check("explicit mask shape [1,H,W]",   msk_explicit.shape == (1, 64, 64),
+          str(msk_explicit.shape))
+finally:
+    shutil.rmtree(tmp2)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 print("\n" + "═" * 60)
+_N_TESTS = 14
 if not errors:
-    print(f"\033[92m  ALL {11} TEST GROUPS PASSED\033[0m\n")
+    print(f"\033[92m  ALL {_N_TESTS} TEST GROUPS PASSED\033[0m\n")
 else:
     print(f"\033[91m  {len(errors)} CHECK(S) FAILED:\033[0m")
     for e in errors:
