@@ -4,6 +4,172 @@ import torch.nn.functional as F
 import numpy as np
 import functools
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CloudRemovalLoss
+# ─────────────────────────────────────────────────────────────────────────────
+class CloudRemovalLoss(nn.Module):
+    """
+    Combined loss for multi-temporal Kalman-SNN cloud removal.
+
+    Components
+    ----------
+    L_rec   : SSIM + L1  reconstruction loss on the final output.
+    L_cloud : Binary-cross-entropy supervision for the cloud estimation head.
+              Only applied when ground-truth cloud masks are available.
+              λ_cloud weights this term (default 0.1).
+    L_tmc   : Temporal Model Calibration loss (ICML 2025 style).
+              Encourages gradient diversity across L temporal steps by
+              penalising early steps more when cumulative confidence is low.
+              λ_tmc weights this term (default 0.0 → off by default).
+
+    Usage
+    -----
+        criterion = CloudRemovalLoss(lambda_cloud=0.1, lambda_tmc=0.0)
+        loss, log = criterion(restored, target, cloud_maps, gt_masks)
+        loss.backward()
+
+    Parameters
+    ----------
+    lambda_cloud : float  weight of cloud detection BCE loss (0 to disable)
+    lambda_tmc   : float  weight of TMC temporal calibration  (0 to disable)
+    ssim_win     : int    SSIM window size (default 11)
+    """
+
+    def __init__(self, lambda_cloud: float = 0.1,
+                 lambda_tmc: float = 0.0,
+                 ssim_win: int = 11):
+        super().__init__()
+        self.lambda_cloud = lambda_cloud
+        self.lambda_tmc   = lambda_tmc
+        self.ssim_win     = ssim_win
+        self.bce          = nn.BCELoss()
+
+    # ── SSIM helper ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _ssim(x: torch.Tensor, y: torch.Tensor, win: int = 11) -> torch.Tensor:
+        """Mean SSIM over a batch; returns scalar."""
+        C1, C2 = 0.01**2, 0.03**2
+        pad    = win // 2
+        ch     = x.shape[1]
+
+        kernel = torch.ones(ch, 1, win, win, device=x.device,
+                            dtype=x.dtype) / (win * win)
+        mu_x   = F.conv2d(x, kernel, padding=pad, groups=ch)
+        mu_y   = F.conv2d(y, kernel, padding=pad, groups=ch)
+        mu_x2  = mu_x * mu_x
+        mu_y2  = mu_y * mu_y
+        mu_xy  = mu_x * mu_y
+        sig_x2 = F.conv2d(x * x, kernel, padding=pad, groups=ch) - mu_x2
+        sig_y2 = F.conv2d(y * y, kernel, padding=pad, groups=ch) - mu_y2
+        sig_xy = F.conv2d(x * y, kernel, padding=pad, groups=ch) - mu_xy
+
+        num = (2 * mu_xy + C1) * (2 * sig_xy + C2)
+        den = (mu_x2 + mu_y2 + C1) * (sig_x2 + sig_y2 + C2)
+        return (num / den).mean()
+
+    # ── TMC temporal calibration ─────────────────────────────────────────────
+    @staticmethod
+    def _tmc_loss(per_step_outputs: list, target: torch.Tensor,
+                  base_criterion) -> torch.Tensor:
+        """
+        Temporal Model Calibration loss (adapted for regression / image restoration).
+
+        per_step_outputs : list of L tensors, each [B, C, H, W]
+                           intermediate reconstructions (one per temporal step)
+        target           : [B, C, H, W]  ground-truth cloud-free image
+        base_criterion   : callable, e.g. F.l1_loss
+
+        Formulation (adapted from ICML 2025 TMC for regression)
+        --------------------------------------------------------
+        For step l = 0 … L-1:
+            β_l  = 1 − SSIM(cumulative_mean_l.detach(), target)  ∈ (0,1)
+                   (1 − SSIM used so β≈0 means good reconstruction)
+            θ_l  = β_l / (1 − β_l + ε)   (confidence ratio, ∞ if perfect)
+            w_l  = (L − l) / L            (temporal exponent: earlier = larger)
+            L_l  = base_loss(step_l, target) + θ_l^w_l
+
+        Total = mean over L steps.
+        """
+        L     = len(per_step_outputs)
+        total = torch.tensor(0.0, device=target.device)
+
+        _cumsum = torch.zeros_like(per_step_outputs[0])
+
+        for l, out_l in enumerate(per_step_outputs):
+            # Cumulative mean up to step l (history detached, current step live)
+            _cumsum_detached = _cumsum.detach()
+            cum_mean = (_cumsum_detached + out_l) / (l + 1)
+
+            # SSIM-based quality proxy (stop-gradient on history)
+            with torch.no_grad():
+                C1, C2  = 0.01**2, 0.03**2
+                mu_p    = cum_mean.detach().mean(dim=[2, 3], keepdim=True)
+                mu_t    = target.mean(dim=[2, 3], keepdim=True)
+                beta_l  = 1.0 - ((2 * mu_p * mu_t + C1) /
+                                  (mu_p**2 + mu_t**2 + C1)).mean()
+                beta_l  = beta_l.clamp(1e-4, 1 - 1e-4)
+
+            theta_l = beta_l / (1.0 - beta_l + 1e-6)
+            w_l     = (L - l) / L                            # temporal weight
+
+            step_loss = base_criterion(out_l, target)
+            total    += step_loss + (theta_l ** w_l)
+
+            # Advance cumsum (all detached for next iteration)
+            _cumsum = _cumsum.detach() + out_l.detach()
+
+        return total / L
+
+    # ── Main forward ─────────────────────────────────────────────────────────
+    def forward(
+        self,
+        restored:    torch.Tensor,          # [B, C, H, W]  final output
+        target:      torch.Tensor,          # [B, C, H, W]  ground-truth
+        cloud_maps:  torch.Tensor,          # [L, B, 1, H, W]  estimated cloud prob
+        gt_masks:    torch.Tensor = None,   # [L, B, 1, H, W]  GT masks (0=cloud)
+                                            #   or None if unavailable
+        per_step_outputs: list = None,      # list[L] of [B,C,H,W] for TMC
+    ):
+        """
+        Returns
+        -------
+        total_loss : scalar tensor (call .backward() on this)
+        log        : dict  {component_name: float}  for TensorBoard logging
+        """
+        log = {}
+
+        # ── Reconstruction loss (SSIM + L1) ──────────────────────────────
+        ssim_val  = self._ssim(restored, target, self.ssim_win)
+        l1_val    = F.l1_loss(restored, target)
+        L_rec     = (1.0 - ssim_val) + 0.1 * l1_val
+        log['L_rec']  = L_rec.item()
+        log['ssim']   = ssim_val.item()
+        log['l1']     = l1_val.item()
+
+        total = L_rec
+
+        # ── Cloud detection BCE ───────────────────────────────────────────
+        if self.lambda_cloud > 0 and gt_masks is not None:
+            # gt_masks: [L, B, 1, H, W], 1 = cloud, 0 = clear
+            # cloud_maps (predicted): [L, B, 1, H, W]  ∈ (0,1)
+            L_cloud = self.bce(cloud_maps, gt_masks.float())
+            log['L_cloud'] = L_cloud.item()
+            total = total + self.lambda_cloud * L_cloud
+        else:
+            log['L_cloud'] = 0.0
+
+        # ── TMC temporal calibration ──────────────────────────────────────
+        if self.lambda_tmc > 0 and per_step_outputs is not None:
+            L_tmc = self._tmc_loss(per_step_outputs, target, F.l1_loss)
+            log['L_tmc'] = L_tmc.item()
+            total = total + self.lambda_tmc * L_tmc
+        else:
+            log['L_tmc'] = 0.0
+
+        log['total'] = total.item()
+        return total, log
+
 _reduction_modes = ['none', 'mean', 'sum']
 
 def reduce_loss(loss, reduction):
