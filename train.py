@@ -9,6 +9,7 @@ import random
 from dataset_load import Dataload
 import time
 import utils
+import viz_utils
 from model import model
 from warmup_scheduler import GradualWarmupScheduler
 from tqdm import tqdm
@@ -17,47 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 import argparse
 from spikingjelly.activation_based import functional
 import numpy as np
-from PIL import Image
-import torchvision.transforms as transforms
-import torchvision.utils as vutils
 from thop import profile
-
-def save_sample_images(input_img, target_img, restored_img, save_path, epoch, batch_idx, num_samples=4):
-    """
-    Save sample images (input, target, restored) for visualization
-    Stitch multiple samples into one row for easy comparison
-    """
-    # Select first num_samples from the batch
-    num_samples = min(num_samples, input_img.shape[0])
-    
-    # Prepare images for stitching
-    input_samples = input_img[:num_samples]
-    target_samples = target_img[:num_samples]
-    restored_samples = restored_img[:num_samples]
-    
-    # Create a grid with 3 rows (input, target, restored) and num_samples columns
-    grid_images = []
-    
-    # Input images row
-    grid_images.append(input_samples)
-    # Target images row  
-    grid_images.append(target_samples)
-    # Restored images row
-    grid_images.append(restored_samples)
-    
-    # Concatenate all rows
-    full_grid = torch.cat(grid_images, dim=0)
-    
-    # Create grid layout: 3 rows x num_samples columns
-    grid = vutils.make_grid(full_grid, nrow=num_samples, padding=2, normalize=False)
-    
-    # Convert to PIL image and save
-    grid_np = grid.cpu().detach().numpy().transpose(1, 2, 0)
-    grid_np = np.clip(grid_np * 255, 0, 255).astype(np.uint8)
-    grid_pil = Image.fromarray(grid_np)
-    
-    # Save only the stitched comparison image
-    grid_pil.save(os.path.join(save_path, f'epoch_{epoch}_batch_{batch_idx}_comparison.png'))
 
 if __name__ == "__main__":
     ######### Set Seeds ###########
@@ -107,8 +68,10 @@ if __name__ == "__main__":
     utils.mkdir(sample_dir)
     train_sample_dir = os.path.join(sample_dir, 'train_samples')
     val_sample_dir = os.path.join(sample_dir, 'val_samples')
+    curves_dir = os.path.join(sample_dir, 'curves')
     utils.mkdir(train_sample_dir)
     utils.mkdir(val_sample_dir)
+    utils.mkdir(curves_dir)
     train_dir = args.train_dir
     val_dir = args.val_dir
     num_epochs = args.num_epochs
@@ -246,6 +209,14 @@ if __name__ == "__main__":
     iter = 0
     scaler = torch.cuda.amp.GradScaler()
 
+    # ── Metric history for curve plots ────────────────────────────────────────
+    history = {
+        'Train PSNR':  [],
+        'Val PSNR':    [],
+        'Epoch Loss':  [],
+        'LR':          [],
+    }
+
     for epoch in range(start_epoch, num_epochs + 1):
         epoch_start_time = time.time()
         epoch_loss = 0
@@ -292,7 +263,25 @@ if __name__ == "__main__":
             
             # Save sample training images every 10 epochs
             if epoch % 10 == 0 and i == 0:  # Save only first batch of every 10th epoch
-                save_sample_images(input_, target_, restored, train_sample_dir, epoch, i)
+                with torch.no_grad():
+                    sample_path = os.path.join(
+                        train_sample_dir, f'epoch_{epoch}.png')
+                    viz_utils.save_rich_comparison_derain(
+                        input_, target_, restored, sample_path)
+                    # TensorBoard image panels
+                    n_tb = min(4, input_.shape[0])
+                    tb_imgs = {
+                        'rainy_input': input_[:n_tb],
+                        'clean_target': target_[:n_tb],
+                        'restored': restored[:n_tb].clamp(0, 1),
+                        'error_map': torch.stack([
+                            viz_utils.error_heatmap(
+                                restored[j].clamp(0, 1), target_[j])
+                            for j in range(n_tb)
+                        ]),
+                    }
+                    viz_utils.log_images_tensorboard(
+                        writer, 'train_images', tb_imgs, epoch)
         #### Evaluation ####
         if epoch % val_epochs == 0:
             model_restoration.eval()
@@ -311,17 +300,49 @@ if __name__ == "__main__":
                 
                 # Save sample validation images (only first batch)
                 if not val_sample_saved:
-                    save_sample_images(input_, target, restored, val_sample_dir, epoch, ii)
+                    with torch.no_grad():
+                        viz_utils.save_rich_comparison_derain(
+                            input_, target, restored,
+                            os.path.join(val_sample_dir, f'epoch_{epoch}.png'))
+                        # TensorBoard val image panels
+                        n_tb = min(4, input_.shape[0])
+                        tb_imgs_v = {
+                            'rainy_input':  input_[:n_tb],
+                            'clean_target': target[:n_tb],
+                            'restored':     restored[:n_tb].clamp(0, 1),
+                            'error_map': torch.stack([
+                                viz_utils.error_heatmap(
+                                    restored[j].clamp(0, 1), target[j])
+                                for j in range(n_tb)
+                            ]),
+                        }
+                        viz_utils.log_images_tensorboard(
+                            writer, 'val_images', tb_imgs_v, epoch)
                     val_sample_saved = True
 
             psnr_val_rgb = torch.stack(psnr_val_rgb).mean().item()
             writer.add_scalar('val/psnr', psnr_val_rgb, epoch)
+
+            history['Val PSNR'].append((epoch, psnr_val_rgb))
+            history['Epoch Loss'].append((epoch, epoch_loss / max(1, len(train_loader))))
+            history['LR'].append((epoch, scheduler.get_lr()[0]))
+
             if psnr_val_rgb > best_psnr:
                 best_psnr = psnr_val_rgb
                 best_epoch = epoch
                 torch.save(model_restoration.state_dict(), os.path.join(model_dir, "model_best.pth"))
 
             print("[epoch %d Training PSNR: %.4f --- best_epoch %d Test_PSNR %.4f]" % (epoch, psnr_train, best_epoch, best_psnr))
+
+            # Metric-history curves
+            viz_utils.save_metric_curves(
+                history,
+                os.path.join(curves_dir, 'metrics.png'),
+                title=f'VLIFNet Deraining Metrics  (session={session})')
+
+        # Per-epoch train PSNR history
+        history['Train PSNR'].append((epoch, psnr_train))
+
         if epoch % 50 == 0:
             torch.save({'epoch': epoch,
                         'state_dict': model_restoration.state_dict(),
@@ -338,4 +359,10 @@ if __name__ == "__main__":
                 epoch, time.time() - epoch_start_time, loss.item(), psnr_train, ssim, scheduler.get_lr()[0],
                 best_psnr, ))
         print("-" * 150)
+
+    # Final metric curves
+    viz_utils.save_metric_curves(
+        history,
+        os.path.join(curves_dir, 'metrics_final.png'),
+        title=f'VLIFNet Deraining Metrics — Final  (session={session})')
     writer.close()
