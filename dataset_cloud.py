@@ -50,11 +50,39 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 
+try:
+    import tifffile as tiff
+    _HAS_TIFFFILE = True
+except ImportError:
+    _HAS_TIFFFILE = False
 
-def _load_img(path: str) -> np.ndarray:
-    """Load image as float32 [H, W, C] in [0, 1]."""
-    img = Image.open(path).convert('RGB')
-    return np.array(img, dtype=np.float32) / 255.0
+# Sentinel-2 TOA reflectance × 10000; typical bright pixel ≈ 2000
+_S2_CLIP_MAX = 2000.0
+
+
+def _load_img(path: str, s2_clip_max: float = _S2_CLIP_MAX) -> np.ndarray:
+    """Load image as float32 [H, W, C] in [0, 1].
+
+    PNG / JPG  → standard 8-bit, divide by 255.
+    TIF / TIFF → uint16 Sentinel-2 reflectance values; clips each channel to
+                 [0, s2_clip_max] then normalises to [0, 1], matching the
+                 reference preprocessing pipeline (generate_output_images).
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ('.tif', '.tiff'):
+        if not _HAS_TIFFFILE:
+            raise ImportError(
+                "tifffile is required for .tif input.  "
+                "Install with:  pip install tifffile")
+        arr = tiff.imread(path).astype(np.float32)   # [H, W] or [H, W, C]
+        if arr.ndim == 2:
+            arr = arr[:, :, np.newaxis]
+        arr = arr[:, :, :3]                          # keep only R, G, B bands
+        arr = np.clip(arr, 0, s2_clip_max) / s2_clip_max
+        return arr                                   # [H, W, 3] in [0, 1]
+    else:
+        img = Image.open(path).convert('RGB')
+        return np.array(img, dtype=np.float32) / 255.0
 
 
 def _load_mask(path: str) -> np.ndarray:
@@ -83,18 +111,20 @@ class MultiTemporalCloudDataset(Dataset):
 
     def __init__(
         self,
-        root_dir:   str,
-        L:          int  = 3,
-        patch_size: int  = 256,
-        layout:     str  = 'Sen2MTC',
-        augment:    bool = True,
+        root_dir:    str,
+        L:           int   = 3,
+        patch_size:  int   = 256,
+        layout:      str   = 'Sen2MTC',
+        augment:     bool  = True,
+        s2_clip_max: float = _S2_CLIP_MAX,
     ):
         super().__init__()
-        self.root_dir   = root_dir
-        self.L          = L
-        self.patch_size = patch_size
-        self.augment    = augment
-        self.layout     = layout
+        self.root_dir    = root_dir
+        self.L           = L
+        self.patch_size  = patch_size
+        self.augment     = augment
+        self.layout      = layout
+        self.s2_clip_max = s2_clip_max
 
         # ── Build folder paths ───────────────────────────────────────────
         if layout == 'Sen2MTC':
@@ -133,8 +163,15 @@ class MultiTemporalCloudDataset(Dataset):
             if f.lower().endswith(('.png', '.jpg', '.tif', '.tiff'))
         )
         assert len(self._stems) > 0, f"No images found in {self._target_dir}"
+        # Detect file format from first target file
+        first_ext = os.path.splitext(
+            self._find_file(self._target_dir, self._stems[0]))[1].lower()
+        is_tif = first_ext in ('.tif', '.tiff')
+        norm_info = (f"tif→clip[0,{s2_clip_max}]/norm"
+                     if is_tif else "png→/255")
         print(f"[CloudDataset] {layout} | {len(self._stems)} samples | "
-              f"L={L} | patch={patch_size} | masks={'yes' if self._has_masks else 'no'}")
+              f"L={L} | patch={patch_size} | "
+              f"masks={'yes' if self._has_masks else 'no'} | {norm_info}")
 
     def __len__(self):
         return len(self._stems)
@@ -174,12 +211,12 @@ class MultiTemporalCloudDataset(Dataset):
 
         # Load target
         target_path = self._find_file(self._target_dir, stem)
-        target_img  = _load_img(target_path)          # [H, W, C]
+        target_img  = _load_img(target_path, self.s2_clip_max)   # [H, W, C]
         H, W, _     = target_img.shape
 
         # Load L temporal cloudy images
         cloudy_imgs = [
-            _load_img(self._find_file(d, stem))
+            _load_img(self._find_file(d, stem), self.s2_clip_max)
             for d in self._cloudy_dirs
         ]  # list of L × [H, W, C]
 
